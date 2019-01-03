@@ -1,0 +1,190 @@
+---
+title: "Homicide Analysis"
+author: "Juliana Lebowitz"
+output: html_document
+---
+ 
+```{r setup, include=FALSE}
+library(MASS)
+library(dplyr)
+library(arules)
+library(arulesViz)
+library(readr)
+library(ggplot2)
+library(rpart) 
+library(partykit)
+library(caret)
+library(rpart.plot)
+library(ggrepel)
+```
+
+Import cleaned dataframe
+
+```{r echo = FALSE}
+data_csv <- as.data.frame(read_csv("https://www.dropbox.com/s/iim4yobaqw1i4ch/cleaned_database.csv?dl=1")) 
+```
+
+# Plotting Solve Rates
+
+```{r}
+data_age <- data_csv %>% 
+  group_by(VictimAge) %>%  
+  filter(!VictimAge =="Unknown") %>% 
+  filter(!VictimAge > 100) %>% 
+  summarize((sum(Solve)/sum(Count)), sum(Count)) %>% as.data.frame()  
+names(data_age) <- c("Age", "SolveRate", "Count")
+ggplot(data_age, aes(Age, SolveRate)) + 
+  geom_point(aes(color = factor(Age)), size =3) + 
+  theme_bw() + ggtitle("Solve Rates by Victim Age") + 
+  theme(legend.position="none")
+```
+
+
+```{r}
+data <- data_csv %>% 
+  filter(!Weapon == "Unknown") %>% 
+  group_by(Weapon)  %>% 
+  summarize((sum(Solve)/sum(Count)), sum(Count)) %>%  as.data.frame() 
+names(data) <- c("Object", "SolveRate", "Count")
+data$SolveRate <- round(data$SolveRate,2)
+ggplot(data, aes(Count, SolveRate), jitter=F)  + geom_point(aes(color = factor(Object)), size =3)  + 
+  theme_bw() + geom_smooth(method='lm') + geom_text_repel(aes(label=Object), cex=3) + ggtitle("Homicide Frequency & Solve Rate by Weapon")
+```
+
+```{r}
+data_victim <- data_csv %>% 
+  filter(!VictimSex == "Unknown") %>% 
+  #filter(VictimRace %in% c("Black", "White")) %>%  
+  mutate(Victim = paste(VictimRace, VictimSex)) %>% 
+  group_by(Victim)  %>% # combine race & sex to minimize factor levels
+  summarize((sum(Solve)/sum(Count)), sum(Count)) %>%  as.data.frame() 
+names(data_victim) <- c("Object", "SolveRate", "Count")
+data_victim <- data_victim[data_victim$Count > 2000,]
+data_victim$SolveRate <- round(data_victim$SolveRate,2)
+ggplot(data_victim, aes(Count, SolveRate), jitter=F)  + geom_point(aes(color = factor(Object)), size =3)  + 
+  theme_bw() + geom_smooth(method='lm') + geom_text_repel(aes(label=Object), cex=3) + ggtitle("Homicide Solve Rate & Frequency by Victim Profile")
+```
+
+# Association Rules
+
+```{r results = "hide"} 
+data <- data_csv  %>%  
+  dplyr:: select(-VictimAge, -Relationship, -PerpRace, -PerpAgeGroup, -PerpSex,
+                 -PerpAge, -City,-Solve, -Count, -Year, -Month)  %>%  
+  mutate_if(is.character,as.factor) %>% 
+  mutate_if(is.numeric,as.factor) 
+# all rules
+rules <- sort(apriori(data, parameter = list(conf = 0.9, sup=.002, maxtime=30, maxlen=5)),  
+              by="confidence", decreasing=TRUE) 
+rules <- rules[!lhs(rules) %pin% as.character("Unknown")  
+               &  rhs(rules) %pin% as.character("CrimeSolved")] 
+
+rules <- sort(apriori(data, parameter = list(conf = 0.9, sup=.002, maxtime=30, maxlen=3)),  
+              by="confidence", decreasing=TRUE) 
+solved  <- rules[!lhs(rules) %pin% as.character("Unknown")  
+                 &  lhs(rules) %pin% as.character("VictimRace")
+                 &  rhs(rules) %pin% as.character("CrimeSolved=Yes")] 
+``` 
+
+Top 10 rules that lead to crime being solved
+
+```{r}
+# rhs is crime solved 
+inspect(solved[1:10])
+plot(solved[1:10], method="graph", cex=T, measure="confidence")
+```
+
+# Predictive Algorithm
+
+```{r results = "hide"} 
+data <- data_csv %>% 
+  filter(VictimSex != "Unknown") %>%    # exclude rows with Unknowns (basically NA's)
+  filter(VictimAgeGroup != "Unknown") %>% 
+  filter(VictimRace != "Unknown") %>% 
+  filter(Weapon != "Unknown") %>% 
+  select(State, AgencyName, CrimeSolved, State,VictimSex, VictimAgeGroup, VictimRace, Month, Weapon, Count)  %>%
+  mutate_if(is.character, as.factor)
+# split data into test and train
+set.seed(200000)
+trainIndex <- createDataPartition(data$CrimeSolved, p = .75, list = FALSE, times = 1)
+train <- data[ trainIndex,]
+test  <- data[-trainIndex,]
+```
+
+```{r}
+# create fit model 
+fit <- rpart(CrimeSolved ~ AgencyName + State + VictimRace + VictimAgeGroup +  VictimSex + Month + Weapon,
+             data=train, method="class", minsplit=6, minbucket=3, cp= 0.001)  
+cp <- min(fit$cptable[dim(fit$cptable)[1],])
+prune.fit <- prune(fit, cp = cp)
+party.test <- predict(prune.fit, newdata=test)
+test$Prob <- predict(fit, newdata = test, type="prob")
+test$Prediction <- predict(fit, newdata = test, type="class")
+round(prune.fit$variable.importance) # Agency is most important 
+```
+
+Plotting outcomes vs expected
+
+```{r}
+test$Compare <- as.factor(paste(test$CrimeSolved, test$Prediction))
+levels(test$Compare) <- c("True", "False", "False", "True") 
+table(test$Compare, test$CrimeSolved)
+dim(test[test$Compare=="True",])[1] / dim(test)[1]  # 75% accuracy
+# plotting model predictions vs expected outcomes
+ggplot(test, aes(x=Compare, y=(Count/sum(Count)))) +
+  geom_bar(stat = "identity", aes(fill=CrimeSolved)) +
+  ggtitle("Model Outcomes vs Actual") +  
+  labs(x="Outcomes",y="Percent of Total") 
+```
+
+# Decision Trees
+
+Predict Likelihood a homicide solved based on State & Victim Race
+
+```{r}
+data <- data_csv %>% 
+  filter(VictimSex != "Unknown") %>%  
+  filter(VictimAgeGroup != "Unknown") %>% 
+  filter(VictimRace %in% c("Black", "White")) %>% 
+  filter(Weapon != "Unknown") %>% 
+  mutate(State = as.factor(State)) %>%
+  select(AgencyName, CrimeSolved, State, VictimSex, VictimAge, VictimRace, Month, Weapon, Year, VictimAgeGroup)  %>%
+  mutate_if(is.character, as.factor)
+levels(data$State) <- state.abb[match(levels(data$State),state.name)]  # formatting for plots
+data <- data  %>% filter(!is.na(State))
+fit <- rpart(CrimeSolved ~  State + VictimRace,
+             data=data, method="class", minsplit=6, minbucket=2, cp=.001)
+cp <- min(fit$cptable[dim(fit$cptable)[1],])
+prune.fit <- prune(fit, cp = cp)
+# plot with split labels
+split.fun <- function(x, labs, digits, varlen, faclen)
+{labs <- gsub(",", " ", labs)
+for(i in 1:length(labs)) {
+  labs[i] <- paste(strwrap(labs[i], width=30), collapse="\n")}
+labs}
+rpart.plot(prune.fit, split.fun=split.fun, type=3,  
+           extra=6, main = "Solve Rate by Victim Race & State")            
+```
+
+Predict victim's relationship to perpetrator based on victim sex, race & age
+
+```{r} 
+data <- data_csv %>%
+  select(VictimAgeGroup, VictimSex, 
+         VictimRace, PerpRace, PerpSex, PerpAgeGroup, Relationship) %>%
+  filter(VictimRace %in% c("Black", "White")) %>%  
+  filter(PerpRace %in% c("Black", "White")) %>%  
+  filter(VictimSex != "Unknown") %>%  
+  filter(PerpSex != "Unknown") %>% 
+  filter(VictimAgeGroup != "Unknown") %>%  
+  filter(PerpAgeGroup != "Unknown") %>% 
+  filter(Relationship != "Unknown")  %>%
+  mutate_if(is.character,as.factor) 
+fit <- rpart(Relationship ~ VictimRace + VictimSex  + PerpRace + PerpSex,
+             data=data, method="class", minsplit=2, minbucket=1, cp=.001)
+cp = min(fit$cptable[dim(fit$cptable)[1],])
+prune.fit <- prune(fit, cp = cp)
+rpart.plot(prune.fit, extra=8, type=0, box.palette=0, fallen.leaves = F, main = 
+             "Most Common Relationship Between Perp & Victim by Race") 
+``` 
+
